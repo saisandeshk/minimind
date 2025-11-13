@@ -130,11 +130,12 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         # Extract wandb run ID if available
         wandb_id = None
         if wandb:
-            if hasattr(wandb, 'get_run'):
-                run = wandb.get_run()
-                wandb_id = getattr(run, 'id', None) if run else None
-            else:
-                wandb_id = getattr(wandb, 'id', None)
+            try:
+                # wandb.run is the active run object
+                if hasattr(wandb, 'run') and wandb.run is not None:
+                    wandb_id = wandb.run.id
+            except:
+                pass
 
         # Prepare full resume checkpoint with model, optimizer, and metadata
         resume_data = {

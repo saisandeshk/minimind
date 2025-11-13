@@ -53,19 +53,9 @@ python scripts/prepare_dataset.py \
 ```bash
 # Train with the prepared dataset
 python trainer/train_pretrain.py \
-    --data_config config/data/pretrain/phase1/default.yaml \
-    --use_prepared \
-    --epochs 1 \
-    --batch_size 16 \ # test if the loss is decreasing or not. 
-    --learning_rate 5e-4 \
-    --device cuda:0
-
-# Or let it auto-prepare (slower but simpler)
-python trainer/train_pretrain.py \
-    --data_config config/data/pretrain/phase1/default.yaml \
-    --epochs 1 \
-    --batch_size 16 \
-    --device cuda:0
+         --data_config config/data/pretrain/phase1/default.yaml \
+         --use_prepared --epochs 1 --batch_size 16 --device cuda:0 \
+         --use_wandb --wandb_project "miniGPT-test"
 ```
 
 ---

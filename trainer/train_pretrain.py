@@ -26,12 +26,125 @@ from trainer.trainer_utils import (
 warnings.filterwarnings('ignore')
 
 
+def calculate_mfu(model_flops_per_token, tokens_per_sec, device):
+    """
+    Calculate Model FLOPs Utilization (MFU) - measures hardware efficiency.
+    
+    Args:
+        model_flops_per_token: FLOPs required to process one token
+        tokens_per_sec: Actual throughput in tokens/second
+        device: Device type ('cuda', 'cpu', etc.)
+    
+    Returns:
+        MFU as a percentage (0-100)
+    """
+    import torch
+
+    # Peak FLOPS for different GPUs (in FLOPs for bfloat16)
+    peak_flops = {
+        'A100': 312e12,       # A100 80GB
+        'H100': 989e12,       # H100 80GB
+        'V100': 125e12,       # V100 32GB
+        '4090': 165e12,       # RTX 4090
+        'RTX6000_BLACKWELL': 550e12,  # RTX PRO 6000 Blackwell Max-Q
+        'default': 125e12     # Conservative estimate
+    }
+
+    # Try to detect GPU type
+    if 'cuda' in str(device):
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            if 'A100' in gpu_name:
+                peak = peak_flops['A100']
+            elif 'H100' in gpu_name:
+                peak = peak_flops['H100']
+            elif 'V100' in gpu_name:
+                peak = peak_flops['V100']
+            elif '4090' in gpu_name:
+                peak = peak_flops['4090']
+            elif '6000' in gpu_name and ('Blackwell' in gpu_name or 'PRO' in gpu_name):
+                peak = peak_flops['RTX6000_BLACKWELL']
+            else:
+                peak = peak_flops['default']
+        except:
+            peak = peak_flops['default']
+    else:
+        return 0.0  # MFU not applicable for CPU
+
+    achieved_flops = model_flops_per_token * tokens_per_sec
+    mfu = (achieved_flops / peak) * 100
+    return mfu
+
+
+
+def evaluate(model, eval_loader, device, autocast_ctx, max_batches=None):
+    """
+    Evaluate model on validation/test set.
+    
+    Args:
+        model: The model to evaluate
+        eval_loader: DataLoader for evaluation data
+        device: Device to run evaluation on
+        autocast_ctx: Automatic mixed precision context
+        max_batches: Maximum number of batches to evaluate (None for all)
+    
+    Returns:
+        dict: Dictionary containing eval metrics
+    """
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    num_batches = 0
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    
+    eval_start = time.time()
+    
+    with torch.no_grad():
+        for batch_idx, (X, Y, loss_mask) in enumerate(eval_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+                
+            X = X.to(device)
+            Y = Y.to(device)
+            loss_mask = loss_mask.to(device)
+            
+            with autocast_ctx:
+                res = model(X)
+                loss = loss_fct(
+                    res.logits.view(-1, res.logits.size(-1)),
+                    Y.view(-1)
+                ).view(Y.size())
+                
+                # Apply mask and sum
+                batch_loss = (loss * loss_mask).sum().item()
+                batch_tokens = loss_mask.sum().item()
+                
+                total_loss += batch_loss
+                total_tokens += batch_tokens
+                num_batches += 1
+    
+    eval_time = time.time() - eval_start
+    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+    
+    model.train()
+    
+    return {
+        'eval/loss': avg_loss,
+        'eval/runtime': eval_time,
+        'eval/samples_per_second': (num_batches * eval_loader.batch_size) / eval_time if eval_time > 0 else 0,
+        'eval/steps_per_second': num_batches / eval_time if eval_time > 0 else 0,
+        'eval/num_batches': num_batches,
+        'eval/total_tokens': total_tokens,
+    }
+
+
 def train_epoch(
     epoch: int, 
     loader: DataLoader, 
     iters: int, 
     start_step: int = 0, 
-    wandb=None
+    wandb=None,
+    eval_loader=None
 ) -> None:
     """
     Train the model for a single epoch during the pretraining phase.
@@ -62,9 +175,21 @@ def train_epoch(
         - Distributed training support across multiple GPUs
         - Periodic checkpointing and logging
     """
-    # Initialize loss function and timer
+    # Debug: Print wandb status at start
+    if is_main_process():
+        Logger(f"[DEBUG] train_epoch started - wandb={'enabled' if wandb else 'disabled'}")
+    
+    # Initialize loss function, timers, and tracking variables
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
+    epoch_start_time = time.time()
+    total_tokens_seen = 0
+    grad_norm = 0.0
+    
+    # Calculate model FLOPs per token (approximate for transformer)
+    # Formula: 6 * n_params (2 for forward, 4 for backward)
+    n_params = sum(p.numel() for p in model.parameters())
+    model_flops_per_token = 6 * n_params
     
     # Iterate through data batches, starting from the specified step
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
@@ -99,12 +224,16 @@ def train_epoch(
 
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
+        
+        # Track tokens processed in this batch
+        batch_tokens = loss_mask.sum().item()
+        total_tokens_seen += batch_tokens
 
         # Update weights only every accumulation_steps
         if (step + 1) % args.accumulation_steps == 0:
-            # Unscale gradients before clipping
+            # Unscale gradients before clipping and compute gradient norm
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
 
             # Optimizer step and zero gradients
             scaler.step(optimizer)
@@ -121,13 +250,61 @@ def train_epoch(
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60  # Estimated time remaining
             
+            # Calculate throughput metrics
+            tokens_per_sec = total_tokens_seen / spend_time if spend_time > 0 else 0
+            samples_per_sec = (step * args.batch_size) / spend_time if spend_time > 0 else 0
+            steps_per_sec = step / spend_time if spend_time > 0 else 0
+            
+            # Calculate MFU (Model FLOPs Utilization)
+            mfu = calculate_mfu(model_flops_per_token, tokens_per_sec, args.device)
+            
+            # Global step across all epochs
+            global_step = epoch * iters + step
+            
             Logger(
                 f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
-                f'loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:'
+                f'loss:{current_loss:.6f} lr:{current_lr:.12f} '
+                f'grad_norm:{grad_norm:.4f} tokens/s:{tokens_per_sec:.0f} '
+                f'MFU:{mfu:.2f}% epoch_Time:{eta_min}min'
             )
             
-            if wandb: 
-                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+            # Run evaluation if enabled and at eval interval
+            eval_metrics = {}
+            if eval_loader and args.eval_interval > 0 and (step % args.eval_interval == 0 or step == iters - 1):
+                if is_main_process():
+                    Logger("Running evaluation...")
+                eval_metrics = evaluate(model, eval_loader, args.device, autocast_ctx, max_batches=args.eval_batches)
+                if is_main_process():
+                    Logger(f"Eval loss: {eval_metrics['eval/loss']:.6f}, Eval runtime: {eval_metrics['eval/runtime']:.2f}s")
+            
+            # Log to wandb with comprehensive metrics
+            if wandb:
+                log_dict = {
+                    # Training metrics
+                    "train/loss": current_loss,
+                    "train/learning_rate": current_lr,
+                    "train/grad_norm": grad_norm,
+                    "train/epoch": epoch + (step / iters),
+                    "train/global_step": global_step,
+                    
+                    # Throughput metrics
+                    "train/tokens_per_second": tokens_per_sec,
+                    "train/samples_per_second": samples_per_sec,
+                    "train/steps_per_second": steps_per_sec,
+                    "train/num_input_tokens_seen": total_tokens_seen,
+                    
+                    # Efficiency metrics
+                    "train/mfu_percent": mfu,
+                    "train/eta_minutes": eta_min,
+                    
+                    # System metrics
+                    "system/epoch_time": spend_time / 60,  # in minutes
+                }
+                
+                # Add eval metrics if available
+                log_dict.update(eval_metrics)
+                
+                wandb.log(log_dict, step=global_step)
 
         # Model checkpointing (only on main process in distributed training)
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
@@ -150,7 +327,7 @@ def train_epoch(
             # Save full checkpoint with optimizer state for training resumption
             lm_checkpoint(
                 lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints'
+                scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='checkpoints'
             )
             model.train()
 
@@ -183,7 +360,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     
     # Directory and naming
-    parser.add_argument("--save_dir", type=str, default="../out", help="Model save directory")
+    parser.add_argument("--save_dir", type=str, default="out", help="Model save directory")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="Prefix for saved weights")
     
     # Training hyperparameters
@@ -199,6 +376,8 @@ if __name__ == "__main__":
     # Logging and saving intervals
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval (steps)")
     parser.add_argument("--save_interval", type=int, default=100, help="Model saving interval (steps)")
+    parser.add_argument("--eval_interval", type=int, default=500, help="Evaluation interval (steps), 0 to disable")
+    parser.add_argument("--eval_batches", type=int, default=100, help="Number of batches to use for evaluation")
     
     # Model architecture
     parser.add_argument('--hidden_size', default=512, type=int, help="Hidden layer dimension")
@@ -207,7 +386,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
     
     # Data and initialization
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="Pretraining data path (JSONL file)")
+    parser.add_argument("--data_path", type=str, default="dataset/pretrain_hq.jsonl", help="Pretraining data path (JSONL file)")
     parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config (alternative to --data_path)")
     parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL from data_config (skip re-preparation)")
     parser.add_argument('--from_weight', default='none', type=str, help="Base weight for training, 'none' means train from scratch")
@@ -240,7 +419,7 @@ if __name__ == "__main__":
     
     # Check for existing checkpoint if resuming training
     ckp_data = lm_checkpoint(
-        lm_config, weight=args.save_weight, save_dir='../checkpoints'
+        lm_config, weight=args.save_weight, save_dir='checkpoints'
     ) if args.from_resume == 1 else None
     
     # ========== 3. Set up mixed precision training ==========
@@ -251,17 +430,23 @@ if __name__ == "__main__":
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. Configure wandb logging ==========
-    # Note: This imports swanlab as wandb, which is a Chinese experiment tracking platform
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb as wandb_module
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = (
-            f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
+            f"miniGPT-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
             f"LearningRate-{args.learning_rate}"
         )
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) #type: ignore 
+        wandb_run = wandb_module.init(
+            project=args.wandb_project, 
+            name=wandb_run_name, 
+            id=wandb_id, 
+            resume=resume
+        )
+        wandb = wandb_module  # Use the module for logging
+        print(f"✅ Wandb initialized: {wandb_run.name} (ID: {wandb_run.id})") 
     
     # ========== 5. Initialize model, dataset, and optimizer ==========
     # Initialize model and tokenizer
@@ -290,7 +475,8 @@ if __name__ == "__main__":
         
         # Generate output filenames based on config
         config_name = Path(args.data_config).stem  # e.g., "default"
-        train_jsonl = f"../dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        train_jsonl = f"dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        val_jsonl = f"dataset/{mixer.config.phase}_{config_name}_val.jsonl"
         
         # Prepare dataset (or skip if already prepared)
         if not args.use_prepared or not os.path.exists(train_jsonl):
@@ -300,6 +486,12 @@ if __name__ == "__main__":
                     output_file=train_jsonl,
                     split="train"
                 )
+                # Also prepare validation if eval is enabled
+                if args.eval_interval > 0 and not os.path.exists(val_jsonl):
+                    mixer.prepare_dataset(
+                        output_file=val_jsonl,
+                        split="validation"
+                    )
             
             # Wait for main process to finish preparation
             if dist.is_initialized():
@@ -308,19 +500,38 @@ if __name__ == "__main__":
             if is_main_process():
                 print(f"Using pre-prepared dataset: {train_jsonl}")
         
-        # Load the prepared JSONL file
+        # Load the prepared JSONL files
         train_ds = PretrainDataset(train_jsonl, tokenizer, max_length=args.max_seq_len) #type: ignore
+        
+        # Load validation dataset if eval is enabled and file exists
+        eval_ds = None
+        if args.eval_interval > 0 and os.path.exists(val_jsonl):
+            eval_ds = PretrainDataset(val_jsonl, tokenizer, max_length=args.max_seq_len) #type: ignore
+            if is_main_process():
+                print(f"Loaded {len(eval_ds)} validation samples from {val_jsonl}")
         
         if is_main_process():
             print(f"Loaded {len(train_ds)} training samples from {train_jsonl}")
     else:
         # Original mode: direct JSONL file
         train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len) #type: ignore
+        eval_ds = None  # No eval in original mode
         if is_main_process():
             print(f"Loaded {len(train_ds)} training samples from {args.data_path}")
     
     # Set up distributed sampler for multi-GPU training
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    
+    # Create evaluation loader if eval dataset exists
+    eval_loader = None
+    if eval_ds is not None:
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
     
     # Initialize gradient scaler for mixed precision
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
@@ -367,7 +578,7 @@ if __name__ == "__main__":
                 f'Epoch [{epoch + 1}/{args.epochs}]: Skipping first {start_step} steps, '
                 f'starting from step {start_step + 1}'
             )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb, eval_loader)
         else:
             # Standard dataloader for normal training
             loader = DataLoader(
@@ -378,4 +589,4 @@ if __name__ == "__main__":
                 num_workers=args.num_workers, 
                 pin_memory=True
             )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), 0, wandb, eval_loader)

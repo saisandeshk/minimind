@@ -8,3 +8,4 @@ dataset/minimind_dataset/
 **/__pycache__/
 checkpoints/
 .pytest_cache/
+wandb/
