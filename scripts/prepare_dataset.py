@@ -74,11 +74,23 @@ def main():
     if not args.train_only:
         print(f"Validation set: {val_file}")
     
-    print("\nYou can now train with:")
+    print("\nYou can now train with (If pre-train):")
     print(f"  python trainer/train_pretrain.py \\")
     print(f"      --data_config {args.config} \\")
     print(f"      --use_prepared \\")
     print(f"      --epochs 1")
+    print()
+
+    print("\nYou can now train with (If mid-train):")
+    print(f"  python trainer/train_midtrain.py \\")
+    print(f"      --data_config {args.config} \\")
+    print(f"      --from weight out/pretrain_512.pth")
+    print(f"      --use_prepared \\")
+    print(f"      --epochs 1\\")
+    print(f"      --batch_size 16\\")
+    print(f"      --learning_rate 2e-4\\")
+    print(f"      --use_wandb\\")
+    print(f"      --wandb_project "miniGPT-midtrain-experiment"\\")
     print()
 
 

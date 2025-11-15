@@ -1,0 +1,67 @@
+metadata:
+  phase: "midtrain_phase1"
+  description: "Mid-training with diverse knowledge - code, reasoning, and general text replay"
+  total_tokens: 50_000_000  # 50M tokens for testing
+  max_seq_length: 512
+  version: "1.0"
+
+datasets:
+  # 1. Replay from pre-training (30%) - prevent catastrophic forgetting
+  - name: "tinystories_replay"
+    source: "roneneldan/TinyStories"
+    mix_ratio: 0.3
+    format: "huggingface"
+    text_field: "text"
+    splits: ["train"]
+    max_samples: 30000
+    
+    filters:
+      - type: "length"
+        min_length: 100
+        max_length: 2000
+      
+      - type: "quality"
+        min_score: 0.3  # Higher quality threshold for replay
+  
+  # 2. Code-focused data (35%) - improve programming abilities
+  - name: "code_instructions"
+    source: "iamtarun/python_code_instructions_18k_alpaca"
+    mix_ratio: 0.35
+    format: "huggingface"
+    text_field: "output"  # Contains Python code + explanations
+    splits: ["train"]
+    max_samples: 35000
+    
+    filters:
+      - type: "length"
+        min_length: 50
+        max_length: 2000
+      
+      - type: "quality"
+        min_score: 0.2
+      
+      - type: "code_quality"
+        min_code_ratio: 0.1  # At least 10% code characters
+  
+  # 3. Math/Reasoning data (35%) - improve logical thinking
+  - name: "math_qa"
+    source: "lighteval/mmlu"
+    config_name: "all"
+    mix_ratio: 0.35
+    format: "huggingface"
+    text_field: "question"  # MMLU questions for reasoning
+    splits: ["test"]  # Use test split for variety
+    max_samples: 35000
+    
+    filters:
+      - type: "length"
+        min_length: 20
+        max_length: 1000
+      
+      - type: "quality"
+        min_score: 0.2
+
+validation:
+  ratio: 0.05  # 5% for validation
+  seed: 42
+  stratified: true

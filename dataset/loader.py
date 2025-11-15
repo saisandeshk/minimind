@@ -12,7 +12,8 @@ def load_single_dataset(
     source: str,
     format: str,
     splits: List[str] = ['train'],
-    cache_dir: Optional[str] = None
+    cache_dir: Optional[str] = None, 
+    config_name: Optional[str] = None,
 ) -> Dataset:
     """
     Load a single dataset from various sources.
@@ -31,34 +32,41 @@ def load_single_dataset(
         >>> print(len(dataset))
     """
     if format == 'huggingface':
-        # Load from HuggingFace Hub
+        # Prepare common kwargs for load_dataset (do NOT pass trust_remote_code)
+        load_kwargs = {}
+        if cache_dir:
+            load_kwargs['cache_dir'] = cache_dir
+        if config_name:
+            load_kwargs['name'] = config_name
+
         try:
             # Concatenate multiple splits if needed
             if len(splits) == 1:
-                dataset = load_dataset(
-                    source,
-                    split=splits[0],
-                    cache_dir=cache_dir,
-                    trust_remote_code=True  # Some datasets need this
-                )
+                try:
+                    dataset = load_dataset(source, split=splits[0], **load_kwargs)
+                except ValueError as e:
+                    # Helpful fallback for lighteval/mmlu when config is missing
+                    if "Config name is missing" in str(e) and source == "lighteval/mmlu":
+                        dataset = load_dataset(source, name="all", split=splits[0], cache_dir=cache_dir)
+                    else:
+                        raise
             else:
-                # Load and concatenate multiple splits
                 datasets = []
                 for split in splits:
-                    ds = load_dataset(
-                        source,
-                        split=split,
-                        cache_dir=cache_dir,
-                        trust_remote_code=True
-                    )
+                    try:
+                        ds = load_dataset(source, split=split, **load_kwargs)
+                    except ValueError as e:
+                        if "Config name is missing" in str(e) and source == "lighteval/mmlu":
+                            ds = load_dataset(source, name="all", split=split, cache_dir=cache_dir)
+                        else:
+                            raise
                     datasets.append(ds)
-                
-                # Concatenate all splits
+
                 from datasets import concatenate_datasets
                 dataset = concatenate_datasets(datasets)
-            
+
             return dataset
-            
+
         except Exception as e:
             raise RuntimeError(f"Failed to load HuggingFace dataset '{source}': {str(e)}")
     

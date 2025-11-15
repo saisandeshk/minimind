@@ -54,6 +54,13 @@ def apply_filters(dataset: Dataset, filters: List[Dict[str, Any]], text_field: s
                 text_field=text_field
             )
         
+        elif filter_type == 'code_quality':
+            dataset = filter_by_code_quality(
+                dataset,
+                min_code_ratio=filter_config.get('min_code_ratio', 0.1),
+                text_field=text_field
+            )
+        
         else:
             print(f"Warning: Unknown filter type '{filter_type}', skipping...")
     
@@ -193,6 +200,88 @@ def filter_by_language(
     # TODO: Implement actual language detection when needed
     print(f"  Language filter (placeholder): keeping {languages}")
     return dataset
+
+
+def filter_by_code_quality(
+    dataset: Dataset,
+    min_code_ratio: float = 0.1,
+    text_field: str = 'text'
+) -> Dataset:
+    """
+    Filter dataset by code content ratio.
+    
+    Useful for filtering code-related datasets to ensure they actually contain code.
+    Detects code by looking for common programming patterns like:
+    - Indentation (spaces/tabs at line start)
+    - Common keywords (def, class, import, function, var, etc.)
+    - Code symbols ({, }, [, ], =, ==, !=, etc.)
+    
+    Args:
+        dataset: Input dataset
+        min_code_ratio: Minimum ratio of code-like characters (0.0 to 1.0)
+        text_field: Field containing text
+        
+    Returns:
+        Filtered dataset
+    """
+    def code_quality_filter(example):
+        text = example.get(text_field, '')
+        code_ratio = calculate_code_ratio(text)
+        return code_ratio >= min_code_ratio
+    
+    return dataset.filter(code_quality_filter)
+
+
+def calculate_code_ratio(text: str) -> float:
+    """
+    Calculate the ratio of code-like content in text.
+    
+    Uses heuristics to detect code:
+    - Lines with indentation
+    - Common programming keywords
+    - Code-specific symbols
+    
+    Args:
+        text: Input text
+        
+    Returns:
+        Ratio between 0.0 and 1.0 indicating code content
+    """
+    if not text or len(text) < 10:
+        return 0.0
+    
+    lines = text.split('\n')
+    if len(lines) == 0:
+        return 0.0
+    
+    code_indicators = 0
+    
+    # Check for indented lines (common in code)
+    indented_lines = sum(1 for line in lines if line.startswith(('    ', '\t')))
+    code_indicators += indented_lines / len(lines) * 0.3
+    
+    # Check for common programming keywords
+    code_keywords = [
+        'def ', 'class ', 'import ', 'from ', 'return ', 'if ', 'else:', 'elif ',
+        'for ', 'while ', 'function ', 'var ', 'let ', 'const ', 'print(',
+        'cout', 'printf', '#include', 'public ', 'private ', 'void ', 'int ',
+    ]
+    text_lower = text.lower()
+    keyword_count = sum(1 for keyword in code_keywords if keyword in text_lower)
+    code_indicators += min(keyword_count / 5, 0.3)  # Max 0.3 from keywords
+    
+    # Check for code symbols
+    code_symbols = ['{', '}', '[', ']', '==', '!=', '<=', '>=', '=>', '->', '::']
+    symbol_count = sum(text.count(symbol) for symbol in code_symbols)
+    symbol_ratio = min(symbol_count / len(text) * 100, 0.2)  # Max 0.2 from symbols
+    code_indicators += symbol_ratio
+    
+    # Check for semicolons and parentheses (common in many languages)
+    special_chars = text.count(';') + text.count('(') + text.count(')')
+    special_ratio = min(special_chars / len(text) * 50, 0.2)  # Max 0.2
+    code_indicators += special_ratio
+    
+    return min(1.0, max(0.0, code_indicators))
 
 
 def remove_duplicates(

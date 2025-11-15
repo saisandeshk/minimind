@@ -9,9 +9,14 @@ config/data/
 ├── pretrain/
 │   ├── phase1/
 │   │   └── default.yaml       # Default pretraining mixture
+│   │   └── general.yaml  
+│   │   └── reasoning.yaml  
 │   └── phase2/
 ├── midtrain/
 │   ├── phase1/
+│   │   └── default.yaml  # Default midtraining mixture
+│   │   └── code_heavy.yaml  
+│   │   └── math_heavy.yaml  
 │   └── phase2/
 └── posttrain/
     ├── sft/
